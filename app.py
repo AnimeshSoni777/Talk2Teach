@@ -21,6 +21,27 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 
+
+
+# =========================
+# 🔐 Persistent Gemini API Key Setup
+# =========================
+from pathlib import Path
+from dotenv import load_dotenv, set_key
+
+# Path to your local .env file (auto-created if missing)
+ENV_PATH = Path(".env")
+load_dotenv(dotenv_path=ENV_PATH)
+
+def get_saved_key() -> str:
+    """Load saved Gemini key from .env if available"""
+    return os.getenv("GEMINI_API_KEY", "")
+
+def save_key(key: str):
+    """Save Gemini key to .env file"""
+    if key:
+        set_key(ENV_PATH, "GEMINI_API_KEY", key)
+
 # =========================
 # Page & Global Settings
 # =========================
@@ -665,6 +686,47 @@ def gemini_slides(api_key: str, model_name: str, text: str) -> List[Dict[str, An
         })
     return cleaned
 
+
+def generate_quiz_from_pdf(text: str, gemini_key: str, num_questions: int = 5) -> List[Dict[str, str]]:
+    """
+    Use Gemini to auto-generate quiz questions (MCQs) from the uploaded PDF text.
+    """
+    genai.configure(api_key=gemini_key)
+    model = genai.GenerativeModel(ss.gemini_model_name or "gemini-2.0-flash")
+
+    prompt = f"""
+You are an expert quiz maker.
+Create {num_questions} multiple-choice questions (MCQs) based on the following study material.
+
+Rules:
+- Each question should be conceptual, simple, and relevant to the given text.
+- Each question must have 4 options (A, B, C, D).
+- Clearly mark the correct option.
+- Return JSON only in this format:
+{{
+  "quiz": [
+    {{
+      "question": "...",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "answer": "A"
+    }}
+  ]
+}}
+
+Text:
+{text[:2500]}
+"""
+
+    try:
+        resp = model.generate_content(prompt)
+        data = safe_json_from_llm(resp.text)
+        quiz = data.get("quiz", [])
+        return quiz
+    except Exception as e:
+        st.error(f"⚠️ Quiz generation failed: {e}")
+        return []
+
+
 # =========================
 # Pipeline
 # =========================
@@ -734,11 +796,24 @@ st.markdown(
 
 with st.sidebar:
     st.header("🔑 Keys & Settings")
-    gemini_key = st.text_input("Gemini API Key", type="password")
+
+    # ✅ Persistent Gemini API Key (saved in .env)
+    saved_key = get_saved_key()
+    if "gemini_key" not in ss:
+        ss.gemini_key = saved_key or ""
+
+    entered_key = st.text_input("Gemini API Key", type="password", value=ss.gemini_key)
+    if entered_key and entered_key != ss.gemini_key:
+        ss.gemini_key = entered_key
+        save_key(entered_key)  # persist to .env file
+        st.success("🔒 Gemini API Key saved locally!")
+
+    gemini_key = ss.gemini_key  # use this everywhere below
+
     ss.gemini_model_name = st.selectbox(
-    "Gemini Model",
-    ["gemini-2.5-flash", "gemini-2.5-pro"],
-    index=0
+        "Gemini Model",
+        ["gemini-2.5-flash", "gemini-2.5-pro"],
+        index=0
     )
 
     st.caption("Audio uses free gTTS (Hindi accent for Hinglish); FFmpeg needed for speed & video.")
@@ -764,6 +839,7 @@ with st.sidebar:
     else:
         st.error("FFmpeg not found (video & speed change disabled)")
 
+
 colA, colB = st.columns([2,1])
 with colA:
     st.subheader("📄 Upload PDF")
@@ -784,6 +860,12 @@ with colB:
                 mime="video/mp4",
                 use_container_width=True
             )
+
+        # 🧩 NEW: Add Take Quiz Button
+        if st.button("🧠 Take Quiz", use_container_width=True):
+            st.session_state.show_quiz = True
+            st.rerun()
+
 
 # Actions
 if generate_btn:
@@ -928,3 +1010,93 @@ else:
     if st.button("🧹 Clear Chat History"):
         ss.chat_history = []
         st.rerun()
+
+
+# =========================
+# 🧠 QUIZ SECTION
+# =========================
+if "show_quiz" not in ss:
+    ss.show_quiz = False
+
+
+# ===== QUIZ DISPLAY & SUBMISSION (replace existing quiz UI) =====
+# Show quiz if available and user clicked "Take Quiz"
+if ss.show_quiz:
+    st.divider()
+    st.subheader("🧠 Practice Quiz — Test What You Learned")
+
+    # Generate quiz button (if quiz not generated yet)
+    if ss.slides:
+        if st.button("📝 Generate Quiz from this PDF"):
+            with st.spinner("Generating quiz questions..."):
+                text_for_quiz = " ".join([s.get("hinglish_script", "") for s in ss.slides])
+                ss.quiz = generate_quiz_from_pdf(text_for_quiz, gemini_key)
+                # initialize answer state and submission flags
+                ss.quiz_submitted = False
+                ss.quiz_score = None
+                for i in range(len(ss.quiz or [])):
+                    key = f"ans_{i}"
+                    ss[key] = None
+            st.success(f"✅ {len(ss.quiz)} questions generated!")
+
+    # If quiz exists, render questions (but DO NOT grade yet)
+    if "quiz" in ss and ss.quiz:
+        st.write("### 📚 Take the Quiz")
+        for i, q in enumerate(ss.quiz):
+            st.markdown(f"**Q{i+1}. {q.get('question','')}**")
+            options = q.get("options", [])
+            sel_key = f"ans_{i}"
+            ss.setdefault(sel_key, None)
+            selected = st.radio(
+                f"Select your answer for Q{i+1}:",
+                options,
+                index=options.index(ss[sel_key]) if ss[sel_key] in options else 0,
+                key=sel_key,
+                horizontal=False
+            )
+            st.divider()
+
+        # Submit button — only now do we grade
+        if st.button("✅ Submit Answers"):
+            total = len(ss.quiz)
+            score = 0
+            for i, q in enumerate(ss.quiz):
+                sel = ss.get(f"ans_{i}", None)
+                correct_letter = q.get("answer", "").strip()
+                if correct_letter.endswith(")"):
+                    correct_letter = correct_letter.rstrip(")")
+                is_correct = False
+                if sel:
+                    sel_letter = sel.split(")")[0].strip() if ")" in sel else sel.split(" ")[0].strip()
+                    if sel_letter.upper().startswith(correct_letter.upper()):
+                        is_correct = True
+                if is_correct:
+                    score += 1
+            ss.quiz_score = score
+            ss.quiz_submitted = True
+            st.success(f"You scored {score}/{total} ✅")
+
+        # If already submitted, show feedback per question
+        if ss.get("quiz_submitted", False):
+            st.write("### ✅ Quiz Feedback")
+            for i, q in enumerate(ss.quiz):
+                sel = ss.get(f"ans_{i}", None)
+                correct_letter = q.get("answer", "").strip()
+                if correct_letter.endswith(")"):
+                    correct_letter = correct_letter.rstrip(")")
+                correct = False
+                if sel:
+                    chosen_letter = sel.split(")")[0].strip() if ")" in sel else sel.split(" ")[0].strip()
+                    correct = chosen_letter.upper().startswith(correct_letter.upper())
+                if correct:
+                    st.success(f"Q{i+1}: ✅ Correct — {sel}")
+                else:
+                    correct_opt = next((o for o in q.get("options", []) if o.strip().upper().startswith(correct_letter.upper())), None)
+                    st.error(f"Q{i+1}: ❌ Your answer: {sel or 'No answer'} — Correct: {correct_opt or correct_letter}")
+            st.divider()
+            if st.button("🔁 Retry Quiz"):
+                ss.quiz_submitted = False
+                ss.quiz_score = None
+                for i in range(len(ss.quiz)):
+                    ss[f"ans_{i}"] = None
+                st.experimental_rerun()
